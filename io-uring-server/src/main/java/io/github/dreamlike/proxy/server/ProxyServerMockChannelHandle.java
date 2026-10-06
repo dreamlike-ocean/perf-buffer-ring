@@ -2,6 +2,7 @@ package io.github.dreamlike.proxy.server;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
@@ -24,6 +25,8 @@ import java.util.concurrent.locks.LockSupport;
 public class ProxyServerMockChannelHandle extends SimpleChannelInboundHandler<FullHttpRequest> {
     private static final AsciiString PROXY_SERVER_NAME = AsciiString.cached("proxy-server");
     private static final Executor VT_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+    // Duration of the simulated blocking call (Redis and the like); run-perf.sh runs 5, 10 and 20 ms via -Dperf.blocking.ms.
+    private static final long BLOCKING_NANOS = TimeUnit.MILLISECONDS.toNanos(Long.getLong("perf.blocking.ms", 5));
     private static final ByteBuf MOCK_RESPONSE = Unpooled.unreleasableBuffer(Unpooled.directBuffer(2 * 1024));
 
     static {
@@ -36,12 +39,24 @@ public class ProxyServerMockChannelHandle extends SimpleChannelInboundHandler<Fu
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest msg) throws Exception {
         msg.retain();
-        CompletableFuture.runAsync(() -> runBlockingHandle(msg), VT_EXECUTOR)
+        StageTrace trace = StageTrace.ENABLED ? new StageTrace() : null;
+        CompletableFuture.runAsync(() -> {
+                    if (trace != null) {
+                        trace.vtStart = System.nanoTime();
+                    }
+                    runBlockingHandle(msg);
+                    if (trace != null) {
+                        trace.parkEnd = System.nanoTime();
+                    }
+                }, VT_EXECUTOR)
                 .thenRunAsync(() -> {
-                    echo(ctx, msg);
+                    if (trace != null) {
+                        trace.loopStart = System.nanoTime();
+                    }
+                    echo(ctx, msg, trace);
                     boolean crossThread = ThreadLocalRandom.current().nextInt(2) == 0;
                     if (crossThread) {
-                        // 在 acceptor 线程归还 request，覆盖 allocator 的跨线程回收。
+                        // Release the request on the acceptor thread to exercise the allocator's cross-thread release path.
                         ctx.channel().parent().eventLoop().execute(msg::release);
                     } else {
                         msg.release();
@@ -50,13 +65,13 @@ public class ProxyServerMockChannelHandle extends SimpleChannelInboundHandler<Fu
     }
 
     private void runBlockingHandle(FullHttpRequest msg) {
-        // 一般是走redis或者其它的阻塞调用
-        LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(5));
+        // Usually a call to Redis or another blocking service.
+        LockSupport.parkNanos(BLOCKING_NANOS);
         msg.headers().add(PROXY_SERVER_NAME, "proxy-server");
     }
 
-    private void echo(ChannelHandlerContext ctx, FullHttpRequest fullHttpMessage) {
-        // 每次发送使用独立的读写索引，共享 JSON 的内容。
+    private void echo(ChannelHandlerContext ctx, FullHttpRequest fullHttpMessage, StageTrace trace) {
+        // Each response gets its own reader/writer indices over the shared JSON content.
         DefaultFullHttpResponse defaultFullHttpResponse = new DefaultFullHttpResponse(
                 HttpVersion.HTTP_1_1, HttpResponseStatus.OK, MOCK_RESPONSE.duplicate());
         defaultFullHttpResponse.headers().set(HttpHeaderNames.CONTENT_LENGTH, MOCK_RESPONSE.readableBytes());
@@ -65,6 +80,10 @@ public class ProxyServerMockChannelHandle extends SimpleChannelInboundHandler<Fu
         if (streamId != -1) {
             defaultFullHttpResponse.headers().add(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(), streamId);
         }
-        ctx.channel().writeAndFlush(defaultFullHttpResponse);
+        ChannelFuture written = ctx.channel().writeAndFlush(defaultFullHttpResponse);
+        if (trace != null) {
+            boolean http2 = streamId != -1;
+            written.addListener(future -> trace.record(http2, System.nanoTime()));
+        }
     }
 }

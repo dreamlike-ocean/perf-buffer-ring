@@ -5,8 +5,9 @@ import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 诊断用：记录一个请求在 server 内部各阶段的耗时，每个 worker 线程每 5 秒打印一次自己的分位数后清零。
- * 只有 -Dperf.trace=true 时启用，正式压测不开。{@link #record} 只在 worker event loop 上调用，汇总数据按线程分开，不需要同步。
+ * Diagnostics only: records how long a request spends in each stage inside the server. Every worker thread prints its
+ * own percentiles every 5 seconds and then resets them. Enabled only with -Dperf.trace=true, never in the real runs.
+ * {@link #record} is only called on a worker event loop and the samples are kept per thread, so no synchronization is needed.
  */
 final class StageTrace {
     static final boolean ENABLED = Boolean.getBoolean("perf.trace");

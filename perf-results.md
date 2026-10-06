@@ -1,61 +1,108 @@
-# Server 模拟行为
+# io_uring buffer ring allocator 对比：adaptive vs recycling
 
-- 同一端口 4399 接收明文 HTTP/1.1 和 HTTP/2 prior knowledge 请求，使用 1 个 acceptor 线程和 1 个 worker 线程。
-- 收到完整 request 后保留引用，交给虚拟线程，用 `LockSupport.parkNanos` 等待 5 ms，模拟 Redis 等阻塞调用。
-- 业务完成后回到 worker 线程，返回 HTTP 200 和固定的 2048 字节 JSON。响应内容由一个 static final、unreleasable direct buffer 共享，每次发送使用独立的读写索引。
-- request 释放线程随机选择：约 50% 在 worker 线程释放，约 50% 提交到 acceptor 线程释放，覆盖 allocator 的跨线程回收。
-- 业务等待期间，H1 的聚合 content 引用 ring 派生 buffer，H2 持有 adapter 复制 DATA 后的聚合 content。
+对比 Netty 自带的 `IoUringAdaptiveBufferRingAllocator` 和 PR [netty/netty#17635](https://github.com/netty/netty/pull/17635) 中的 `IoUringRecyclingBufferRingAllocator`（本地代码与 PR 版本一致）。使用开环爬坡找出各自的最大 QPS，并比较相同负载下 worker 线程的 CPU 开销。
 
-测试日期为 2026-10-06。机器为 Intel Core i5-13600KF，Linux 7.3.0-6-generic，Oracle GraalVM 25.0.2，Netty 4.2.18.Final。Server 绑定 CPU 2，client 绑定 CPU 4，两者位于不同物理核心。两个 JVM 均使用 512 MiB 固定堆、G1、`ActiveProcessorCount=1`，关闭 Netty 泄漏检测并开启 Unsafe 支持。
+## 结论
 
-worker 的 buffer ring 大小为 4096，批量补充 2048 个 buffer。adaptive 的 buffer 最小/初始大小为 1024 字节，最大为 4096 字节，`largeAllocation=true`。recycling 的 buffer 固定为 1024 字节。
+- **最大 QPS 相同**：3 种阻塞时间下，两种 allocator 都在 18 万 QPS 通过、20 万 QPS 到顶。到顶时两个 worker 线程合计约 190%–199%，也就是两个 worker 都已跑满，瓶颈在 server。
+- **相同负载下的 worker CPU 没有可测出的差异**：差别在 ±4% 以内，正负方向不固定，属于单次测量的噪声范围。
+- **延迟相同**：未到顶时，两者的 P99 基本相同，只比业务阻塞时间多出约 0.2–3.7 ms。
+- **recycling 没有退化到 fallback**：所有组的 `fallbackAllocations` 和 `foreignThreadAllocations` 都是 0。region 没有被用尽，也没有在非 event loop 线程上分配。
 
-两轮测试均使用 POST，请求体和响应体各 2048 字节，H1/H2 请求数各占 50%。实测 QPS 按统计时间内收到的成功响应数计算。P99 从实际发送到收到响应计时，“含发压排队 P99”还计入客户端调度和排队时间。
+在这个 HTTP 场景里，allocator 不是瓶颈：瓶颈在 worker event loop 上 HTTP/H2 的编解码和 io_uring 的收发，allocator 本身的差异不足以影响最大 QPS。
 
-## 1. 固定 QPS
+## 测试环境
 
-每档预热 30 秒，统计 30 秒。H1 使用 64 条连接，每条连接同时一个请求。H2 使用 4 条连接，每条最多 32 个并发 stream。
+- **机器和软件**：Intel Core i5-13600KF（6 个 P 核共 12 个超线程，加 8 个 E 核），Linux 7.3.0-6-generic，Oracle GraalVM 25.0.2，Netty 4.2.18.Final。
+- **JVM**：server 和 client 都使用 512 MiB 固定堆和 G1，关闭 Netty 泄漏检测，开启 Unsafe。
+- **CPU 隔离**：只按进程隔离，进程内的线程不单独绑核。server 运行在 P 核（CPU 0–11）上，client 运行在 E 核（CPU 12–19）上。
+- **测试日期**：2026-10-06。
 
-| 目标总 QPS | allocator | H1 QPS | H2 QPS | 总 QPS | P99（ms） | 含发压排队 P99（ms） |
-|---:|---|---:|---:|---:|---:|---:|
-| 1000 | adaptive | 500.00 | 500.00 | 1000.00 | 6.081 | 6.688 |
-| 2000 | adaptive | 1000.00 | 1000.00 | 2000.00 | 6.161 | 6.562 |
-| 4000 | adaptive | 2000.00 | 2000.00 | 4000.00 | 6.515 | 6.912 |
-| 1000 | recycling | 500.00 | 500.00 | 1000.00 | 5.984 | 6.069 |
-| 2000 | recycling | 1000.00 | 1000.00 | 2000.00 | 5.472 | 5.566 |
-| 4000 | recycling | 2000.00 | 2000.00 | 4000.00 | 5.277 | 5.683 |
+### Server
 
-六组测试的失败、连接池满（pool_busy）、未完成请求均为 0。
+- **线程**：1 个 acceptor、2 个 worker event loop（`-Dperf.workers=2`），端口 4399 同时接收明文 HTTP/1.1 和 HTTP/2 prior knowledge。
+- **io_uring buffer ring**：ring 大小 4096，批量补充 2048 个 buffer，`batchAllocation=true`，开启 multishot recv。
+- **adaptive**：buffer 最小和初始 1024 字节，最大 4096 字节，`largeAllocation=true`。
+- **recycling**：固定 4096 字节一个 slot，与 adaptive 的最大 buffer 一致，避免两边单次 recv 的粒度不同。in-flight 余量取默认值（ring 大小的 1/4），每个 worker 线程各有一块 region。
+- **业务模拟**：收到完整请求后保留引用，交给虚拟线程，用 `LockSupport.parkNanos` 等待 5、10 或 20 ms（`-Dperf.blocking.ms`），模拟 Redis 等阻塞调用。完成后回到 worker 线程，返回 HTTP 200 和固定的 2048 字节 JSON。
+- **跨线程释放**：请求在 worker 线程和 acceptor 线程上释放各占约一半，覆盖 recycling 的跨线程归还路径。
+- **业务期间持有的 buffer**：H1 的聚合 content 引用 ring 派生出来的 buffer；H2 持有的是 adapter 复制 DATA 帧之后得到的聚合 content。
 
-两种 allocator 都达到 1000、2000、4000 QPS，吞吐相同。本轮 recycling 的 P99 更低，三档分别低 0.097、0.689、1.238 ms。
+### Client
 
-原始数据：`target/perf/20261006-154117/results.csv`。
+- **发压线程**：5 个独立的 NIO event loop，发送时间表在每个 loop 内部按 tick 执行，没有跨线程投递。全局时间表上的第 i 个请求由第 `i % 5` 个 loop 发送。
+- **连接**：H1 共 8192 条连接，每条同时只有一个请求；H2 共 128 条连接，每条最多 64 个并发 stream。
+- **请求**：POST，请求体和响应体都是 2048 字节。H1 和 H2 按全局序号的奇偶交替，QPS 严格五五开。
 
-## 2. 不限速
+## 测试方法：开环爬坡
 
-每档预热 15 秒，统计 20 秒。每组同时发出一个 H1 和一个 H2 请求，两个都完成后再补下一组。并发组数依次为 64、128、256、512、1024、2048，对应最多 128、256、512、1024、2048、4096 个在途请求。
+- **开环**：每档按目标 QPS 严格按时间表发请求，不等上一个请求的响应。时间表的最小粒度是 1 ms，每 1 ms 发出一批到期的请求。
+- **爬坡**：从 2 万 QPS 开始，每档增加 2 万。全程第一档之前先不统计地预热 15 秒；每一档先不统计地发 5 秒，再统计 15 秒，然后停止发送，等这一档的请求全部完成，再进入下一档。
+- **到顶判定**：满足任意一条就停止加压。
+  - 实际 QPS 低于目标的 95%。
+  - 出现失败（failed）、连接池满（pool_busy）或未完成请求（unfinished）。
+- **最大 QPS**：最后一档满足"实际 QPS ≥ 目标的 95% 且没有任何错误"的目标 QPS。
+- **延迟**：P99 从实际发送开始计时；`arrival_p99` 从计划发送时间开始计时，额外包含 client 侧的调度和排队。
+- **CPU**：统计窗口前后读取 `/proc` 下的 utime + stime。worker 是所有 `perf-worker-*` 线程合计，client loop 是所有 `perf-client-*` 线程合计，100% 等于一个核。
+- **隔离**：每一组（allocator × 阻塞时间）都启动全新的 server 和 client 进程。
 
-连接池为 2048 条 H1 连接、32 条 H2 连接。H1 每条连接同时一个请求，H2 每条连接最多 64 个并发 stream。
+## 结果
 
-| 并发组数 | allocator | H1 QPS | H2 QPS | 总 QPS | P99（ms） | 含发压排队 P99（ms） |
-|---:|---|---:|---:|---:|---:|---:|
-| 64 | adaptive | 12348.30 | 12348.30 | 24696.60 | 6.728 | 6.788 |
-| 128 | adaptive | 24169.35 | 24169.35 | 48338.70 | 7.100 | 7.185 |
-| 256 | adaptive | 40582.95 | 40582.95 | 81165.90 | 9.668 | 10.067 |
-| 512 | adaptive | 49096.40 | 49096.00 | 98192.40 | 14.841 | 15.935 |
-| 1024 | adaptive | 48977.80 | 48993.90 | 97971.70 | 29.473 | 32.348 |
-| 2048 | adaptive | 40175.25 | 40172.35 | 80347.60 | 74.024 | 74.717 |
-| 64 | recycling | 12357.60 | 12357.60 | 24715.20 | 6.425 | 6.481 |
-| 128 | recycling | 24164.60 | 24164.60 | 48329.20 | 7.746 | 7.875 |
-| 256 | recycling | 40549.70 | 40549.70 | 81099.40 | 9.916 | 10.221 |
-| 512 | recycling | 45538.25 | 45538.15 | 91076.40 | 15.241 | 16.177 |
-| 1024 | recycling | 44448.80 | 44464.70 | 88913.50 | 33.488 | 34.804 |
-| 2048 | recycling | 37674.55 | 37652.05 | 75326.60 | 79.627 | 80.100 |
+### 最大 QPS
 
-十二组测试的失败、连接池满（pool_busy）、未完成请求均为 0。每档统计请求的 H1/H2 发送数、成功数一致。时间窗内完成的响应数会因窗口起止时间出现小幅差异。
+| 阻塞时间 | adaptive | recycling | 到顶档（20 万）worker CPU（adaptive / recycling） |
+|---:|---:|---:|---:|
+| 5 ms | 180,000 | 180,000 ¹ | 198.9% / 193.6% |
+| 10 ms | 180,000 | 180,000 | 198.8% / 198.8% |
+| 20 ms | 180,000 | 180,000 | 198.6% / 186.5% |
 
-两种 allocator 的最高实测吞吐都出现在 512 组并发：adaptive 为 98192.40 QPS，recycling 为 91076.40 QPS。以 recycling 为基准，本轮 adaptive 高 7.81%。增加到 1024、2048 组后，吞吐下降，P99 升高。
+¹ recycling + 5 ms 在正式那轮中，于 16 万 QPS 被判定为到顶：0.7% 的请求被拒（pool_busy 11088 次），P99 为 117.5 ms。但这一档 worker 合计只有 156.9%，并没有跑满，看起来像是一次偶发抖动。单独重跑这一组之后，结果与其他组一致：18 万通过，20 万到顶。表中采用重跑的结果，下面的表格中 recycling + 5 ms 也都使用重跑数据。
 
-高并发时，server 进程的 CPU 采样多次达到单核 100%，client 仍有余量。这轮测试主要受 server 处理能力限制。
+步长是 2 万，所以真实上限落在 18 万到 20 万之间，这次测试无法区分这个区间内的差异。
 
-原始数据：`target/perf/20261006-160233/results.csv`、`target/perf/20261006-160233/max-throughput.csv`、`target/perf/20261006-160233/cpu-samples.csv`。以上结论来自该机器和配置下的单次正式测量。
+### 相同负载下的 worker CPU（两个 worker 合计）
+
+| 阻塞时间 | 负载 | adaptive | recycling | 差异 |
+|---:|---:|---:|---:|---:|
+| 5 ms | 10 万 | 94.3% | 94.6% | +0.3% |
+| 5 ms | 14 万 | 129.8% | 127.9% | −1.5% |
+| 5 ms | 18 万 | 165.5% | 166.3% | +0.5% |
+| 10 ms | 10 万 | 104.9% | 98.4% | −6.2% |
+| 10 ms | 14 万 | 138.4% | 134.6% | −2.7% |
+| 10 ms | 18 万 | 168.5% | 165.9% | −1.5% |
+| 20 ms | 10 万 | 98.4% | 98.5% | +0.1% |
+| 20 ms | 14 万 | 138.3% | 139.2% | +0.7% |
+| 20 ms | 18 万 | 169.6% | 165.8% | −2.2% |
+
+差异 = recycling 相对 adaptive 的变化。worker CPU 大致随 QPS 线性增长，每 1 万 QPS 约占一个核的 9%–10%。10 ms 那组 10 万档 −6.2% 是唯一超过 ±3% 的点，同一组其他负载下都在 ±3% 以内，因此判断为单次测量的噪声。
+
+### 18 万 QPS（最后一档通过）的延迟和进程 CPU
+
+| 阻塞时间 | P99 adaptive / recycling | server 进程 CPU adaptive / recycling | client loop CPU adaptive / recycling |
+|---:|---:|---:|---:|
+| 5 ms | 7.370 / 7.169 ms | 359.0% / 352.1% | 383.3% / 379.7% |
+| 10 ms | 12.594 / 12.199 ms | 350.4% / 346.4% | 408.6% / 410.0% |
+| 20 ms | 23.739 / 23.194 ms | 359.0% / 338.6% | 405.9% / 386.8% |
+
+server 进程 CPU 包括 worker、acceptor、虚拟线程 carrier、GC 和 JIT。client 的 5 个 loop 合计约 380%–410%，平均每个约 80%，仍有余量，所以到顶的是 server。
+
+### recycling 的计数
+
+| 阻塞时间 | fallbackAllocations | foreignThreadAllocations |
+|---:|---:|---:|
+| 5 ms | 0 | 0 |
+| 10 ms | 0 | 0 |
+| 20 ms | 0 | 0 |
+
+## 注意事项
+
+- **每组只有一次正式测量**（recycling + 5 ms 额外重跑了一次）。表中 ±4% 以内的差异不应解读为两者有优劣之分。
+- **到顶判定偏严格**：只要有一个请求因为连接池满被拒，这一档就会被判定为到顶。边界附近可能因为一次偶发抖动提前一档停下，recycling + 5 ms 第一次运行就是这种情况。真正到顶时，P50 会从约 5 ms 跳到 45 ms 以上，两者很容易区分。
+- **到顶时 H2 先崩**：到顶时 H1 基本还能维持目标 QPS，H2 则被大量拒绝。这是因为 H2 的在途请求集中在 128 条连接上，连接池余量更小，并不说明 H2 的处理更慢。
+- **为什么不再绑核**：之前的测试只把一个 worker 线程绑到单个核上，有两个问题。一是由 worker 按需创建的虚拟线程 carrier 会继承它的 CPU 亲和性，挤到同一个核上；二是 loopback 的软中断也在这个核上执行。这两部分都不计入 worker 线程的 CPU 时间，导致 worker 显示只有 70%、实际上整个核已经跑满。所以改成 2 个 worker，并只按进程隔离 server 和 client。
+
+## 原始数据
+
+- 正式测量：`target/perf/20261006-173507/`（`results.csv`、`max-throughput.csv`、`recycling-stats.csv`，以及各组的 server 和 client 日志）。
+- recycling + 5 ms 重跑：`target/perf/20261006-175716/`。
+- 复现：`./run-perf.sh`。可用环境变量 `WORKERS`、`CLIENT_LOOPS`、`SERVER_CPUS`、`CLIENT_CPUS`、`BLOCKING_MS`、`ALLOCATORS`、`RAMP_START`、`RAMP_STEP`、`RAMP_MAX` 调整。

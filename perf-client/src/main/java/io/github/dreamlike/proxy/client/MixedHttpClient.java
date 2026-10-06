@@ -32,6 +32,7 @@ import io.netty.handler.codec.http2.Http2ResetFrame;
 import io.netty.handler.codec.http2.Http2StreamChannel;
 import io.netty.handler.codec.http2.Http2StreamChannelBootstrap;
 import io.netty.handler.codec.http2.Http2StreamFrame;
+import io.netty.util.concurrent.DefaultThreadFactory;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
@@ -40,7 +41,10 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 final class MixedHttpClient implements AutoCloseable {
-    private final MultiThreadIoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1, NioIoHandler.newFactory());
+    // CpuUsage finds the client event loop threads by this prefix in /proc/self/task/*/comm (comm is at most 15 chars).
+    static final String LOOP_THREAD_POOL_NAME = "perf-client";
+    private final MultiThreadIoEventLoopGroup group = new MultiThreadIoEventLoopGroup(1,
+            new DefaultThreadFactory(LOOP_THREAD_POOL_NAME), NioIoHandler.newFactory());
     private final EventLoop loop = group.next();
     private final ArrayDeque<Http1Connection> idleHttp1 = new ArrayDeque<>();
     private final List<Channel> channels = new ArrayList<>();
@@ -99,23 +103,22 @@ final class MixedHttpClient implements AutoCloseable {
         }
     }
 
-    void send(boolean useHttp2, RequestStats stats, long scheduled, boolean measured, Runnable completed) {
-        Request request = new Request(stats, scheduled, measured, completed);
-        loop.execute(() -> {
-            if (useHttp2) {
-                sendHttp2(request);
-            } else {
-                sendHttp1(request);
-            }
-        });
+    EventLoop loop() {
+        return loop;
     }
 
-    void sendPair(RequestStats h1, RequestStats h2, long scheduled, boolean measured, Runnable completed) {
-        loop.execute(() -> {
-            PairCompletion pair = new PairCompletion(completed);
-            sendHttp1(new Request(h1, scheduled, measured, pair));
-            sendHttp2(new Request(h2, scheduled, measured, pair));
-        });
+    /**
+     * Must be called on {@link #loop()}: pacing and all connections live on this one event loop, so nothing is handed
+     * over between threads.
+     */
+    void send(boolean useHttp2, RequestStats stats, long scheduled, boolean measured, Runnable completed) {
+        assert loop.inEventLoop();
+        Request request = new Request(stats, scheduled, measured, completed);
+        if (useHttp2) {
+            sendHttp2(request);
+        } else {
+            sendHttp1(request);
+        }
     }
 
     private void sendHttp1(Request request) {
@@ -281,7 +284,6 @@ final class MixedHttpClient implements AutoCloseable {
             this.scheduled = scheduled;
             this.measured = measured;
             this.completed = completed;
-            stats.offered(measured);
         }
 
         private void sent() {
@@ -303,22 +305,6 @@ final class MixedHttpClient implements AutoCloseable {
             finished = true;
             stats.rejected(measured);
             completed.run();
-        }
-    }
-
-    private static final class PairCompletion implements Runnable {
-        private final Runnable completed;
-        private int remaining = 2;
-
-        private PairCompletion(Runnable completed) {
-            this.completed = completed;
-        }
-
-        @Override
-        public void run() {
-            if (--remaining == 0) {
-                completed.run();
-            }
         }
     }
 }

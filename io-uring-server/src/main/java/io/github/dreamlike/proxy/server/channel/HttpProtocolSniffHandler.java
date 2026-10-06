@@ -65,7 +65,7 @@ public class HttpProtocolSniffHandler extends ChannelInboundHandlerAdapter {
 
     private void determiningProtocol(boolean isHttp2, ChannelHandlerContext ctx, ByteBuf firstRequest) throws Exception {
         ChannelPipeline pipeline = ctx.pipeline();
-        // 替换完channelHandler之后然后把截流下来的数据原封不动丢给新的pipeline中
+        // After replacing the handlers, pass the buffered data to the new pipeline unchanged.
         if (isHttp2) {
             configureHttp2(pipeline);
         } else {
@@ -84,8 +84,8 @@ public class HttpProtocolSniffHandler extends ChannelInboundHandlerAdapter {
 
     private void configureHttp2(ChannelPipeline pipeline) {
         DefaultHttp2Connection clientToProxyHttp2Connection = new DefaultHttp2Connection(true);
-        // H2 adapter 会把 DATA 复制到聚合 content，业务等待期间持有的是复制后的 buffer。
-        // H1 aggregator 的 content 引用 ring 派生 buffer，两种持有方式用于模拟各自的协议处理。
+        // The H2 adapter copies DATA into the aggregated content, so the business code holds the copy while it waits.
+        // The H1 aggregator's content references buffers derived from the ring; each mirrors how its protocol is handled.
         InboundHttp2ToHttpAdapter listener = new InboundHttp2ToHttpAdapterBuilder(clientToProxyHttp2Connection).propagateSettings(false)
                 .validateHttpHeaders(false).maxContentLength(16 * 1024).build();
         Http2Settings http2Settings =

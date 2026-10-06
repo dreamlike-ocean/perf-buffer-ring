@@ -16,6 +16,7 @@ import io.netty.channel.uring.IoUringIoHandler;
 import io.netty.channel.uring.IoUringIoHandlerConfig;
 import io.netty.channel.uring.IoUringRecyclingBufferRingAllocator;
 import io.netty.channel.uring.IoUringServerSocketChannel;
+import io.netty.util.concurrent.DefaultThreadFactory;
 
 
 /**
@@ -30,13 +31,19 @@ import io.netty.channel.uring.IoUringServerSocketChannel;
 public class HttpProxyServer {
 
     private static short DEFAULT_BUFFER_GROUP_ID = 1;
+    // The client's CpuUsage sums the CPU of the worker event loop threads by this prefix in /proc/<pid>/task/*/comm (comm is at most 15 chars).
+    static final String WORKER_THREAD_POOL_NAME = "perf-worker";
+    static final int WORKERS = Integer.getInteger("perf.workers", 2);
+    private IoUringRecyclingBufferRingAllocator recyclingAllocator;
     private final ServerBootstrap bootstrap;
     private final MultiThreadIoEventLoopGroup acceptorGroup;
     private final MultiThreadIoEventLoopGroup workerGroup;
 
     public HttpProxyServer(boolean useAdaptiveBufferRingAllocator) {
-        acceptorGroup = new MultiThreadIoEventLoopGroup(1, IoUringIoHandler.newFactory());
-        workerGroup = new MultiThreadIoEventLoopGroup(1, ioHandler(useAdaptiveBufferRingAllocator));
+        acceptorGroup = new MultiThreadIoEventLoopGroup(1, new DefaultThreadFactory("perf-acceptor"),
+                IoUringIoHandler.newFactory());
+        workerGroup = new MultiThreadIoEventLoopGroup(WORKERS, new DefaultThreadFactory(WORKER_THREAD_POOL_NAME),
+                ioHandler(useAdaptiveBufferRingAllocator));
         bootstrap = new ServerBootstrap();
         bootstrap.childOption(IoUringChannelOption.IO_URING_BUFFER_GROUP_ID, DEFAULT_BUFFER_GROUP_ID)
                 .channel(IoUringServerSocketChannel.class)
@@ -49,6 +56,11 @@ public class HttpProxyServer {
     }
 
     public void stop() {
+        if (recyclingAllocator != null) {
+            // run-perf.sh reads this line from the server log into recycling-stats.csv.
+            System.out.printf("recycling_stats,fallback=%d,foreign_thread=%d%n",
+                    recyclingAllocator.fallbackAllocations(), recyclingAllocator.foreignThreadAllocations());
+        }
         acceptorGroup.shutdownGracefully();
         workerGroup.shutdownGracefully();
         acceptorGroup.terminationFuture().syncUninterruptibly();
@@ -56,17 +68,17 @@ public class HttpProxyServer {
     }
 
     protected IoHandlerFactory ioHandler(boolean useAdaptiveBufferRingAllocator) {
-        // note: 对于IoUring的实例调整参数在这里
-        // 默认 sqe为4096长 cqe为8192长
-        // 对于一个链接同时最多只有2个op（recv and send）在使用 所以4096也够用了
-        // 一般场景下 SQE 大小为64B，CQE 大小为16B 对应内存为mmap的得到的共享匿名内存
+        // note: io_uring instance parameters are tuned here.
+        // By default the SQ has 4096 entries and the CQ 8192.
+        // A connection has at most 2 ops in flight at a time (recv and send), so 4096 is enough.
+        // An SQE is usually 64 bytes and a CQE 16 bytes; both live in shared anonymous memory obtained via mmap.
         IoUringIoHandlerConfig ioUringIoHandlerConfiguration = new IoUringIoHandlerConfig();
         ioUringIoHandlerConfiguration.setRingSize(4096);
-        // recv_multishot：Linux 6.0+
-        // multishot_accept：Linux 5.19+
-        // poll_multishot：Linux 5.13+ 这些都满足setupCqSize的需求
+        // recv_multishot: Linux 6.0+
+        // multishot_accept: Linux 5.19+
+        // poll_multishot: Linux 5.13+; all of these satisfy the requirement of setupCqSize.
         if (IoUring.isAcceptMultishotEnabled() || IoUring.isRecvMultishotEnabled() || IoUring.isPollAddMultishotEnabled()) {
-            // 根据社区讨论 如果开启了multi-shot则最好把cq开大点
+            // Following community discussions, the CQ should be larger when multishot is enabled.
             ioUringIoHandlerConfiguration.setCqSize(ioUringIoHandlerConfiguration.getRingSize() * 4);
         }
         if (IoUring.isRegisterBufferRingSupported()) {
@@ -87,7 +99,8 @@ public class HttpProxyServer {
     }
 
     private IoUringBufferRingAllocator recyclingIoUringBufferRingAllocator() {
-        return new IoUringRecyclingBufferRingAllocator((short) 4096, 1024);
+        recyclingAllocator = new IoUringRecyclingBufferRingAllocator((short) 4096, 4 * 1024);
+        return recyclingAllocator;
     }
 
 
