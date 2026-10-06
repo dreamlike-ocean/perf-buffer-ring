@@ -1,6 +1,6 @@
 # io_uring buffer ring allocator 对比：adaptive vs recycling
 
-对比 Netty 自带的 `IoUringAdaptiveBufferRingAllocator` 和 PR [netty/netty#17635](https://github.com/netty/netty/pull/17635) 中的 `IoUringRecyclingBufferRingAllocator`（本地代码与 PR 版本一致）。使用开环爬坡找出各自的最大 QPS，并比较相同负载下 worker 线程的 CPU 开销。
+对比 Netty 自带的 `IoUringAdaptiveBufferRingAllocator` 和 PR [netty/netty#17635](https://github.com/netty/netty/pull/17635) 中的 `IoUringRecyclingBufferRingAllocator`（本地代码与 PR 版本一致）。使用开环爬坡找出各自的最大 QPS，比较相同负载下 worker 线程的 CPU 开销，并用 async-profiler 对比堆和 direct memory 的分配量。
 
 ## 结论
 
@@ -8,6 +8,7 @@
 - **相同负载下的 worker CPU 没有可测出的差异**：差别在 ±4% 以内，正负方向不固定，属于单次测量的噪声范围。
 - **延迟相同**：未到顶时，两者的 P99 基本相同，只比业务阻塞时间多出约 0.2–3.7 ms。
 - **recycling 没有退化到 fallback**：所有组的 `fallbackAllocations` 和 `foreignThreadAllocations` 都是 0。region 没有被用尽，也没有在非 event loop 线程上分配。
+- **recycling 稳定运行时完全不 malloc direct memory**：10 万 QPS 下，adaptive 的 worker 线程平均每个请求 malloc 约 2108 字节（约 210 MB/s 的 direct memory 反复申请和释放），recycling 是 0。堆分配只少了约 3%，在采样误差范围内。详见[分配对比](#分配对比async-profiler)。
 
 在这个 HTTP 场景里，allocator 不是瓶颈：瓶颈在 worker event loop 上 HTTP/H2 的编解码和 io_uring 的收发，allocator 本身的差异不足以影响最大 QPS。
 
@@ -94,6 +95,40 @@ server 进程 CPU 包括 worker、acceptor、虚拟线程 carrier、GC 和 JIT�
 | 10 ms | 0 | 0 |
 | 20 ms | 0 | 0 |
 
+## 分配对比（async-profiler）
+
+### 方法
+
+- **负载**：固定 10 万 QPS、阻塞 5 ms，其他配置与上文相同，两种 allocator 各跑一次，都稳定在 10 万 QPS，没有错误。
+- **采集**：进入统计阶段后，用 async-profiler 4.5 attach 到 server 进程，先采 15 秒堆分配（`-e alloc --total -t`），再采 15 秒 native 内存（`-e nativemem --nofree --total -t`）。netty 的 direct memory 最终通过 `Unsafe.allocateMemory` 调用 malloc 分配，所以能被 `nativemem` 统计到。`--nofree` 表示只统计 malloc，不统计 free。
+- **换算**：15 秒 × 10 万 QPS = 150 万个请求，用总字节数除以请求数，得到每个请求的分配量。
+
+### 结果（平均每个请求）
+
+| | adaptive | recycling |
+|---|---:|---:|
+| native（malloc），worker 线程 | **2108.5 B** | **0 B** |
+| native（malloc），整个进程 | 2116.3 B | 1.8 B |
+| 堆，worker 线程 | 3790.6 B | 3670.0 B |
+| 堆，虚拟线程 carrier | 151.3 B | 151.7 B |
+| 堆，整个进程 | 3941.9 B | 3821.7 B |
+
+### direct memory
+
+- adaptive 的 2108 B/请求全部来自同一条调用路径：`IoUringBufferRing.fill`（批量补充 ring）→ `AbstractIoUringBufferRingAllocator.allocateBatch` → `AdaptivePoolingAllocator.allocate` → **`allocateFallback`** → `AdaptiveByteBufAllocator$DirectChunkAllocator.allocate` → `Unsafe.allocateMemory`。
+- 也就是说，ring 批量补充 buffer 时，`AdaptivePoolingAllocator` 的 magazine 没能分配成功，退回到 fallback：每个 buffer 单独 malloc 一块一次性的 chunk，buffer 释放时再 free。按 10 万 QPS 换算，大约每秒 malloc 和 free 各 210 MB。
+- recycling 在稳定运行时没有任何 malloc：buffer 都从预先申请好的 region 里切出，归还后直接复用。
+- 从源码看，`allocateFallback` 只在 magazine 返回 null 时才会被调用。这次批量补充（一次 2048 个 buffer）时 magazine 为什么会返回 null，还没有查清楚。
+
+### 堆
+
+- worker 线程每个请求少分配约 120 B，大约 3%。差异主要在 `UnpooledSlicedByteBuf`（266.0 对 191.9 B）和 `CompositeByteBuf$Component`（44.7 对 26.2 B）。一个可能的原因是：adaptive 的 buffer 大小在 1–4 KB 之间浮动，buffer 小的时候一个请求需要多次 recv，多出了 slice 和 composite 组件。
+- async-profiler 的堆分配是采样统计，部分 lambda 类在两次运行中的类名也不同，无法逐项对应。所以这 3% 只能视为"略少"。这也符合预期：recycling 节省的主要是 buffer 背后的 direct memory，而 adaptive 的 buffer 对象本身也是池化复用的。
+
+### 与 QPS 结果的关系
+
+每秒约 210 MB 的 malloc/free 没有拉低 adaptive 的最大 QPS，这部分开销被系统吸收了。但它会给 malloc 带来持续压力，也有内存碎片的风险。recycling 把这部分开销完全消除了。
+
 ## 注意事项
 
 - **每组只有一次正式测量**（recycling + 5 ms 额外重跑了一次）。表中 ±4% 以内的差异不应解读为两者有优劣之分。
@@ -105,4 +140,5 @@ server 进程 CPU 包括 worker、acceptor、虚拟线程 carrier、GC 和 JIT�
 
 - 正式测量：`target/perf/20261006-173507/`（`results.csv`、`max-throughput.csv`、`recycling-stats.csv`，以及各组的 server 和 client 日志）。
 - recycling + 5 ms 重跑：`target/perf/20261006-175716/`。
+- 分配对比：`target/perf/20261006-alloc/`（async-profiler 的 collapsed 输出，以及两次压测的日志）。
 - 复现：`./run-perf.sh`。可用环境变量 `WORKERS`、`CLIENT_LOOPS`、`SERVER_CPUS`、`CLIENT_CPUS`、`BLOCKING_MS`、`ALLOCATORS`、`RAMP_START`、`RAMP_STEP`、`RAMP_MAX` 调整。
